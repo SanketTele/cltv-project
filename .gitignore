@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+env/
+venv/
+.ipynb_checkpoints/
+
+# IDEs
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data & models (don't push big raw files)
+data/
+models/*.joblib
+models/*.pkl
+
+# Streamlit / logs
+.streamlit/
+*.log
