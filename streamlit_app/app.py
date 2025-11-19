@@ -14,6 +14,7 @@ DEFAULT_API = "https://cltv-api.onrender.com"  # replace if your Render URL is d
 api_base = st.text_input("API base URL", value=DEFAULT_API)
 predict_url = api_base.rstrip("/") + "/predict"
 
+
 st.markdown("### Single customer prediction")
 with st.form("single_form"):
     cust_id = st.text_input("Customer ID", value="C101")
