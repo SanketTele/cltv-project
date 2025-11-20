@@ -1,3 +1,4 @@
-streamlit>=1.15
-pandas
-requests
+streamlit>=1.18
+pandas>=1.4
+requests>=2.28
+shap>=0.41.0

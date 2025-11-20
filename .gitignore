@@ -24,3 +24,5 @@ models/*.pkl
 # Streamlit / logs
 .streamlit/
 *.log
+.venv/
+
