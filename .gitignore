@@ -26,3 +26,4 @@ models/*.pkl
 *.log
 .venv/
 
+find_bad_escapes.py
