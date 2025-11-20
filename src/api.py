@@ -1,20 +1,29 @@
 # src/api.py
+"""
+CLTV Prediction API with SHAP explanations (TreeExplainer).
+Save as: C:\Users\Sanket\Desktop\Documents\Tasks\cltv-project\src\api.py
+"""
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 import traceback
 import os
-
 import numpy as np
-import xgboost as xgb
+import pandas as pd
 import joblib
 
-# Helper utilities - ensure these exist in src/model_utils.py
-# load_model_and_feature_order() -> (model_object, feature_order_list)
-# prepare_input_df(customers_list, feature_order) -> (X_dataframe_or_numpy, ids_list)
+# SHAP (installed inside Docker)
+import shap
+
+# Local helpers (must exist at src/model_utils.py)
 from .model_utils import load_model_and_feature_order, prepare_input_df
 
-app = FastAPI(title="CLTV Prediction API (XGBoost contributions)", version="1.0")
+app = FastAPI(
+    title="CLTV Prediction API with SHAP",
+    description="Predict Customer Lifetime Value and return SHAP explanations (TreeExplainer)",
+    version="1.0"
+)
 
 # ---------- Root ----------
 @app.get("/")
@@ -22,18 +31,24 @@ def root():
     return {
         "service": "cltv-api",
         "status": "running",
-        "description": "Customer Lifetime Value prediction API (uses XGBoost contributions for explanations)",
-        "endpoints": {"health": "/health", "docs": "/docs", "predict (POST)": "/predict"}
+        "description": "Customer Lifetime Value prediction API with SHAP",
+        "endpoints": {
+            "health": "/health",
+            "docs": "/docs",
+            "predict (POST)": "/predict"
+        }
     }
 
-# ---------- Globals ----------
+# ---------- Globals (populated at startup) ----------
 MODEL = None
 MODEL_FEATURE_ORDER: Optional[List[str]] = None
-# segmentation thresholds (fallbacks; overwritten at startup from env)
+EXPLAINER = None
+
+# default thresholds (can be overridden by env vars)
 LTV_LOW_THRESHOLD = 50.0
 LTV_MED_THRESHOLD = 200.0
 
-# ---------- Pydantic models ----------
+# ---------- Pydantic schemas ----------
 class CustomerFeatures(BaseModel):
     customer_id: str = Field(..., example="C101")
     frequency: float = 0.0
@@ -50,7 +65,7 @@ class CustomerFeatures(BaseModel):
 
 class PredictRequest(BaseModel):
     customers: List[CustomerFeatures]
-    return_explanation: Optional[bool] = False  # ask for per-sample contributions
+    return_explanation: Optional[bool] = False
 
 class FeatureImpact(BaseModel):
     feature: str
@@ -59,10 +74,16 @@ class FeatureImpact(BaseModel):
 class PredictResponseItem(BaseModel):
     customer_id: str
     predicted_LTV: float
-    segment: Optional[str] = None
-    explanation: Optional[List[FeatureImpact]] = None
+    segment: Optional[str]
+    explanation: Optional[List[FeatureImpact]]
 
-# ---------- Utility functions ----------
+# ---------- Utilities ----------
+def safe_float(x, default=0.0):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
 def ltv_to_segment(ltv: float, low_threshold: float, med_threshold: float) -> str:
     if ltv < low_threshold:
         return "Low"
@@ -70,113 +91,125 @@ def ltv_to_segment(ltv: float, low_threshold: float, med_threshold: float) -> st
         return "Medium"
     return "High"
 
-def safe_float(x, default=0.0):
-    try:
-        return float(x)
-    except Exception:
-        return default
-
-# ---------- Startup: load model and thresholds ----------
+# ---------- Startup: load model & build SHAP explainer ----------
 @app.on_event("startup")
 def startup_event():
-    global MODEL, MODEL_FEATURE_ORDER, LTV_LOW_THRESHOLD, LTV_MED_THRESHOLD
+    global MODEL, MODEL_FEATURE_ORDER, EXPLAINER, LTV_LOW_THRESHOLD, LTV_MED_THRESHOLD
+
     try:
         MODEL, MODEL_FEATURE_ORDER = load_model_and_feature_order()
-        print("Model loaded. Feature order:", MODEL_FEATURE_ORDER)
+        print("Model loaded. Features:", MODEL_FEATURE_ORDER)
     except Exception as e:
         MODEL = None
         MODEL_FEATURE_ORDER = None
         print("ERROR loading model:", e)
+        print(traceback.format_exc())
 
-    # Read segmentation thresholds from environment (if present)
+    # read thresholds from environment if provided
     try:
         LTV_LOW_THRESHOLD = safe_float(os.environ.get("LTV_LOW_THRESHOLD", LTV_LOW_THRESHOLD))
         LTV_MED_THRESHOLD = safe_float(os.environ.get("LTV_MED_THRESHOLD", LTV_MED_THRESHOLD))
     except Exception as e:
-        print("Error reading thresholds from environment:", e)
+        print("Error parsing thresholds:", e)
+
     print(f"Segmentation thresholds: low={LTV_LOW_THRESHOLD}, med={LTV_MED_THRESHOLD}")
 
-# ---------- Health ----------
+    # Build SHAP TreeExplainer for tree-based model (XGBoost LightGBM)
+    EXPLAINER = None
+    try:
+        if MODEL is not None:
+            # TreeExplainer works for xgboost.Booster or sklearn wrapper
+            EXPLAINER = shap.TreeExplainer(MODEL)
+            print("SHAP TreeExplainer created successfully.")
+        else:
+            print("Model not loaded; cannot build SHAP explainer.")
+    except Exception as e:
+        EXPLAINER = None
+        print("SHAP explainer creation failed:", e)
+        print(traceback.format_exc())
+
+# ---------- Health endpoint ----------
 @app.get("/health")
 def health():
     return {
         "status": "ok",
         "model_loaded": MODEL is not None,
+        "explainer_loaded": EXPLAINER is not None,
         "feature_count": len(MODEL_FEATURE_ORDER) if MODEL_FEATURE_ORDER else 0,
         "thresholds": {"low": LTV_LOW_THRESHOLD, "med": LTV_MED_THRESHOLD}
     }
 
-# ---------- Prediction endpoint (with XGBoost contributions) ----------
+# ---------- Prediction endpoint ----------
 @app.post("/predict", response_model=List[PredictResponseItem])
 def predict(req: PredictRequest):
     try:
         if MODEL is None or MODEL_FEATURE_ORDER is None:
             raise HTTPException(status_code=503, detail="Model not loaded on server.")
 
-        # Prepare inputs
+        # prepare inputs; prepare_input_df returns (X, ids)
         customers_list = [c.dict() for c in req.customers]
         X, ids = prepare_input_df(customers_list, MODEL_FEATURE_ORDER)
 
-        # Convert X to numpy array if it's a pandas DataFrame
-        try:
-            import pandas as pd
-            if isinstance(X, pd.DataFrame):
-                X_np = X.values
-            else:
-                X_np = np.array(X)
-        except Exception:
-            X_np = np.array(X)
+        # ensure X is pandas DataFrame (SHAP/Model support)
+        if not isinstance(X, pd.DataFrame):
+            try:
+                X = pd.DataFrame(X, columns=MODEL_FEATURE_ORDER)
+            except Exception:
+                X = pd.DataFrame(X)
 
-        # Predict LTV
-        preds = MODEL.predict(X_np)
-        preds = [float(max(0.0, p)) for p in preds]  # clamp negative predictions to 0.0
+        # Predictions
+        preds_raw = MODEL.predict(X)
+        preds = [float(max(0.0, p)) for p in preds_raw]
 
-        # Thresholds (allow env override per request)
+        # thresholds (allow environment override)
         low_th = safe_float(os.environ.get("LTV_LOW_THRESHOLD", LTV_LOW_THRESHOLD))
         med_th = safe_float(os.environ.get("LTV_MED_THRESHOLD", LTV_MED_THRESHOLD))
 
-        need_expl = bool(getattr(req, "return_explanation", False))
+        need_expl = bool(req.return_explanation) and EXPLAINER is not None
 
-        # Compute contributions only if requested
-        contribs = None
+        # compute shap values if requested
+        shap_values = None
         if need_expl:
             try:
-                # Try sklearn wrapper predict with pred_contribs flag
-                try:
-                    contribs_np = MODEL.predict(X_np, pred_contribs=True)
-                except TypeError:
-                    # Fallback: use booster + DMatrix
-                    dmat = xgb.DMatrix(X_np, feature_names=MODEL_FEATURE_ORDER)
-                    contribs_np = MODEL.get_booster().predict(dmat, pred_contribs=True)
-                contribs = np.array(contribs_np)
-                # If XGBoost returns an extra bias/expected_value column, drop it
-                if contribs.ndim == 2 and contribs.shape[1] == len(MODEL_FEATURE_ORDER) + 1:
-                    contribs = contribs[:, :len(MODEL_FEATURE_ORDER)]
-                # If shape mismatch, set to None
-                if contribs.ndim != 2 or contribs.shape[1] != len(MODEL_FEATURE_ORDER):
-                    print("Unexpected contributions shape:", getattr(contribs, "shape", None))
-                    contribs = None
+                # EXPLAINER(X) returns Explanation; shap_values often in .values
+                expl_res = EXPLAINER(X)
+                if hasattr(expl_res, "values"):
+                    shap_values = np.array(expl_res.values)
+                else:
+                    shap_values = np.array(expl_res)  # fallback
+                # shap_values shape -> (n_samples, n_features)
+                if shap_values.ndim != 2 or shap_values.shape[1] != len(MODEL_FEATURE_ORDER):
+                    # Unexpected shape; log and disable explanations
+                    print("Unexpected shap_values shape:", getattr(shap_values, "shape", None))
+                    shap_values = None
             except Exception as e:
-                print("XGBoost contributions failed:", e)
-                contribs = None
+                print("SHAP computation failed:", e)
+                print(traceback.format_exc())
+                shap_values = None
+                need_expl = False
 
-        # Build response
+        # Build response list
         results: List[Dict[str, Any]] = []
-        for i, (cid, p) in enumerate(zip(ids, preds)):
-            seg = ltv_to_segment(p, low_th, med_th)
-            item: Dict[str, Any] = {"customer_id": cid, "predicted_LTV": p, "segment": seg}
+        for i, cid in enumerate(ids):
+            pred = preds[i]
+            seg = ltv_to_segment(pred, low_th, med_th)
+            item: Dict[str, Any] = {
+                "customer_id": cid,
+                "predicted_LTV": pred,
+                "segment": seg
+            }
 
-            if need_expl and contribs is not None:
-                row = contribs[i]
-                abs_impacts = np.abs(row)
+            if need_expl and shap_values is not None:
+                row = shap_values[i]
+                abs_vals = np.abs(row)
                 k = 3
-                top_idx = abs_impacts.argsort()[::-1][:k]
-                top_list = []
+                top_idx = abs_vals.argsort()[::-1][:k]
+                explanation_list = []
                 for idx in top_idx:
                     feat = MODEL_FEATURE_ORDER[idx]
                     impact = float(row[idx])
-                    top_list.append({"feature": feat, "impact": impact})
-                item["explanation"] = top_list
+                    explanation_list.append({"feature": feat, "impact": impact})
+                item["explanation"] = explanation_list
 
             results.append(item)
 
