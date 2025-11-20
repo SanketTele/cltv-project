@@ -1,8 +1,7 @@
 # src/api.py
 """
 CLTV Prediction API with robust SHAP explainer builder.
-Overwrite this file at:
-C:\Users\Sanket\Desktop\Documents\Tasks\cltv-project\src\api.py
+This file does NOT contain any Windows backslash paths to avoid unicodeescape issues.
 """
 
 import os
@@ -89,17 +88,14 @@ def _debug_print(title: str, obj: Any = None):
 def build_shap_explainer(model, sample_X=None):
     """
     Try multiple ways to construct a SHAP explainer:
-    1. If model has get_booster() or booster_ -> use the Booster directly with TreeExplainer.
-    2. If that fails, try TreeExplainer(model).
-    3. If still fails, try generic shap.Explainer(model, data=sample_X) as a last resort.
-
-    Returns explainer or None.
+    1) If model has get_booster() or booster_ -> use Booster with TreeExplainer.
+    2) Try TreeExplainer(model).
+    3) Fallback to shap.Explainer(model, data=sample_X).
     """
     if shap is None:
         print("SHAP is not installed in runtime.")
         return None
 
-    # Try to extract booster if present (XGB sklearn wrapper)
     booster = None
     try:
         if hasattr(model, "get_booster"):
@@ -117,7 +113,6 @@ def build_shap_explainer(model, sample_X=None):
     except Exception:
         booster = None
 
-    # 1) Try TreeExplainer with Booster (preferred)
     if booster is not None:
         try:
             expl = shap.TreeExplainer(booster)
@@ -127,7 +122,6 @@ def build_shap_explainer(model, sample_X=None):
             print("Failed to build TreeExplainer from Booster:", e)
             print("Traceback:", traceback.format_exc())
 
-    # 2) Try TreeExplainer with the model directly
     try:
         expl = shap.TreeExplainer(model)
         print("SHAP TreeExplainer built from model successfully.")
@@ -136,14 +130,12 @@ def build_shap_explainer(model, sample_X=None):
         print("Failed to build TreeExplainer from model:", e)
         print("Traceback:", traceback.format_exc())
 
-    # 3) Fallback: generic shap.Explainer (may be slower)
     try:
         if sample_X is not None:
             expl = shap.Explainer(model, sample_X)
             print("SHAP generic Explainer built with sample data (fallback).")
             return expl
         else:
-            # attempt without background data (may still work)
             expl = shap.Explainer(model)
             print("SHAP generic Explainer built without sample data (fallback).")
             return expl
@@ -153,7 +145,7 @@ def build_shap_explainer(model, sample_X=None):
 
     return None
 
-# Startup event: load model, thresholds, and build explainer
+# Startup event: load model, thresholds, build explainer
 @app.on_event("startup")
 def startup_event():
     global MODEL, MODEL_FEATURE_ORDER, EXPLAINER, LTV_LOW_THRESHOLD, LTV_MED_THRESHOLD
@@ -168,23 +160,18 @@ def startup_event():
         print("ERROR: Failed to load model at startup.")
         print(traceback.format_exc())
 
-    # thresholds
     LTV_LOW_THRESHOLD = safe_float(os.environ.get("LTV_LOW_THRESHOLD", LTV_LOW_THRESHOLD))
     LTV_MED_THRESHOLD = safe_float(os.environ.get("LTV_MED_THRESHOLD", LTV_MED_THRESHOLD))
     print(f"Segmentation thresholds: low={LTV_LOW_THRESHOLD}, med={LTV_MED_THRESHOLD}")
 
-    # Build SHAP explainer using robust builder
     EXPLAINER = None
     if MODEL is None:
         print("Model not loaded; SKIPPING SHAP explainer creation.")
         return
 
-    # prepare a small sample X (1-5 rows) to pass to generic explainer fallback if needed
     sample_X = None
     try:
-        # Try to construct an empty DataFrame shaped to the model features
-        import pandas as _pd
-        sample_X = _pd.DataFrame([ {f: 0.0 for f in MODEL_FEATURE_ORDER} ])
+        sample_X = pd.DataFrame([ {f: 0.0 for f in MODEL_FEATURE_ORDER} ])
     except Exception:
         sample_X = None
 
@@ -213,7 +200,6 @@ def predict(req: PredictRequest):
         customers_list = [c.dict() for c in req.customers]
         X, ids = prepare_input_df(customers_list, MODEL_FEATURE_ORDER)
 
-        # ensure pandas DataFrame
         if not isinstance(X, pd.DataFrame):
             try:
                 X = pd.DataFrame(X, columns=MODEL_FEATURE_ORDER)
@@ -237,7 +223,6 @@ def predict(req: PredictRequest):
             else:
                 try:
                     expl_res = EXPLAINER(X)
-                    # Some SHAP versions return Explanation objects with .values; others return arrays
                     if hasattr(expl_res, "values"):
                         shap_values = np.array(expl_res.values)
                     else:
