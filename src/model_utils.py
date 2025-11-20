@@ -1,74 +1,66 @@
-# model_utils.py
+# src/model_utils.py
+"""
+Model utility functions used by api.py.
+Saves paths using os.path to avoid Windows backslash unicode issues.
+"""
+
 import os
 import joblib
 import pandas as pd
-
-
-MODEL_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(__file__)),
-    "models",
-    "xgb_cltv_model.joblib"
-)
-
+from typing import List, Tuple, Any
 
 def load_model_and_feature_order():
     """
-    Load XGBoost model and determine the correct feature order.
+    Loads the model from ../models/xgb_cltv_model.joblib and returns (model, feature_order).
+    Uses os.path.join for safe path handling across OS.
     """
-    if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(f"Model not found at {MODEL_PATH}")
+    base_dir = os.path.dirname(__file__)  # src/
+    model_path = os.path.join(base_dir, "..", "models", "xgb_cltv_model.joblib")
+    model_path = os.path.normpath(model_path)  # normalize path
 
-    model = joblib.load(MODEL_PATH)
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found at {model_path}")
 
-    # Try to read feature names from booster
-    try:
-        booster = model.get_booster()
-        feature_order = booster.feature_names
-    except:
-        feature_order = getattr(model, "feature_names_in_", None)
+    model = joblib.load(model_path)
 
-    # Last fallback (should rarely be used)
-    if not feature_order:
-        feature_order = [
-            "frequency",
-            "total_spend",
-            "aov",
-            "recency_days",
-            "T_days",
-            "avg_interpurchase_days",
-            "active_months",
-            "purchase_days_std",
-            "category_diversity",
-            "avg_order_value",
-            "unique_days"
-        ]
+    # IMPORTANT: this must match the features used during training (order matters)
+    feature_order: List[str] = [
+        "frequency",
+        "total_spend",
+        "aov",
+        "recency_days",
+        "T_days",
+        "avg_interpurchase_days",
+        "active_months",
+        "purchase_days_std",
+        "category_diversity",
+        "avg_order_value",
+        "unique_days"
+    ]
 
     return model, feature_order
 
-
-def prepare_input_df(customers_list, feature_order):
+def prepare_input_df(customers: List[dict], feature_order: List[str]) -> Tuple[Any, List[str]]:
     """
-    Convert user JSON input → DataFrame with correct model feature order.
+    customers: list of dicts, each must include 'customer_id' plus feature keys.
+    feature_order: list of feature column names in the expected order.
+
+    Returns: (X, ids) where X is a pandas DataFrame with columns=feature_order (ordered),
+             and ids is a list of customer_id in same order.
     """
-    df = pd.DataFrame(customers_list)
+    df = pd.DataFrame(customers)
 
-    if "customer_id" not in df:
-        raise ValueError("customer_id missing.")
-
-    ids = df["customer_id"].astype(str).tolist()
-
-    # Auto-generate missing columns
-    if "avg_order_value" not in df.columns and "aov" in df.columns:
-        df["avg_order_value"] = df["aov"]
-
-    if "unique_days" not in df.columns:
-        df["unique_days"] = df["frequency"] if "frequency" in df.columns else 0
-
-    # Ensure all columns exist
-    for col in feature_order:
+    # Ensure required columns exist; if missing, fill with zeros
+    required_cols = ["customer_id"] + feature_order
+    for col in required_cols:
         if col not in df.columns:
+            # fill missing column with zeros (float)
             df[col] = 0.0
 
-    X = df[feature_order].astype(float).fillna(0)
+    # Re-order columns safely
+    df = df[["customer_id"] + feature_order].copy()
+
+    ids = df["customer_id"].astype(str).tolist()
+    X = df[feature_order].astype(float)
 
     return X, ids

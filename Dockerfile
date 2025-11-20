@@ -1,30 +1,27 @@
-# Use official Python image with build tools
+# Dockerfile (placed at repo root: cltv-project/Dockerfile)
 FROM python:3.10-slim
 
-# Install system-level dependencies for SHAP
-RUN apt-get update && apt-get install -y \
+# Install system build tools needed for shap and xgboost wheels
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
     gcc \
     g++ \
-    build-essential \
     libomp-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
 WORKDIR /app
 
-# Copy requirements into image
+# Copy requirements file and install dependencies
 COPY src/requirements.txt /app/requirements.txt
-
-# Install dependencies
 RUN pip install --upgrade pip setuptools wheel && \
     pip install -r /app/requirements.txt
 
-# Copy code
+# Copy application code and models
 COPY src /app/src
 COPY models /app/models
 
-# Expose API port
+# Expose port 8000 for FastAPI
 EXPOSE 8000
 
-# Start FastAPI server
+# Run the fastapi app with uvicorn
 CMD ["uvicorn", "src.api:app", "--host", "0.0.0.0", "--port", "8000"]

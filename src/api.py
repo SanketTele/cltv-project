@@ -1,39 +1,44 @@
 # src/api.py
 """
-Debuggable CLTV Prediction API with SHAP explainability.
-Overwrite this exact file at:
+CLTV Prediction API with optional SHAP explanations (TreeExplainer).
+Use relative paths and safe path handling to avoid Windows unicodeescape issues.
+Save this file at:
 C:\Users\Sanket\Desktop\Documents\Tasks\cltv-project\src\api.py
 """
 
-import os
-import traceback
-from typing import List, Optional, Dict, Any
-
-import numpy as np
-import pandas as pd
-import joblib
-import shap
-
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Any
+import traceback
+import os
+import numpy as np
+import pandas as pd
 
-# Local helpers (ensure src/model_utils.py exists and matches feature order)
+# optional: shap (only present in Docker environment where requirements include shap)
+try:
+    import shap  # type: ignore
+except Exception:
+    shap = None
+
+# local helper functions (ensure model_utils.py present)
 from .model_utils import load_model_and_feature_order, prepare_input_df
 
-app = FastAPI(title="CLTV API (debug SHAP)",
-              description="CLTV API with verbose logs for SHAP debugging",
-              version="1.0")
+app = FastAPI(
+    title="CLTV Prediction API",
+    description="Predict Customer Lifetime Value and optionally return SHAP explanations (TreeExplainer)",
+    version="1.0"
+)
 
-# Globals to be populated at startup
+# ---------- Globals ----------
 MODEL = None
 MODEL_FEATURE_ORDER: Optional[List[str]] = None
 EXPLAINER = None
+
+# default segmentation thresholds (overridable via env vars)
 LTV_LOW_THRESHOLD = 50.0
 LTV_MED_THRESHOLD = 200.0
 
-# ----------------------------
-# Schemas
-# ----------------------------
+# ---------- Request/Response Schemas ----------
 class CustomerFeatures(BaseModel):
     customer_id: str = Field(..., example="C101")
     frequency: float = 0.0
@@ -62,73 +67,68 @@ class PredictResponseItem(BaseModel):
     segment: Optional[str]
     explanation: Optional[List[FeatureImpact]]
 
-# ----------------------------
-# Utilities
-# ----------------------------
+# ---------- Utility functions ----------
 def safe_float(x, default=0.0):
     try:
         return float(x)
     except Exception:
         return default
 
-def ltv_to_segment(ltv: float, low: float, med: float) -> str:
-    if ltv < low:
+def ltv_to_segment(ltv: float, low_threshold: float, med_threshold: float) -> str:
+    if ltv < low_threshold:
         return "Low"
-    if ltv < med:
+    if ltv < med_threshold:
         return "Medium"
     return "High"
 
-def _debug_print(title: str, obj: Any = None):
-    """Small helper for consistent debug prints in logs."""
-    print("==== DEBUG:", title, "====")
+def _log_debug(title: str, obj: Any = None):
+    """Consistent debug prints for server logs."""
+    print("---- DEBUG:", title, "----")
     if obj is not None:
         try:
             print(obj)
         except Exception:
-            print("Could not print object (type):", type(obj))
-    print("==== /DEBUG ====")
+            print("Could not print debug object of type:", type(obj))
+    print("---- /DEBUG ----")
 
-# ----------------------------
-# Startup: load model, thresholds, build SHAP explainer
-# ----------------------------
+# ---------- Startup: load model and build SHAP explainer if available ----------
 @app.on_event("startup")
 def startup_event():
     global MODEL, MODEL_FEATURE_ORDER, EXPLAINER, LTV_LOW_THRESHOLD, LTV_MED_THRESHOLD
+
+    # Load model and feature order using model_utils (safe relative paths)
     try:
         MODEL, MODEL_FEATURE_ORDER = load_model_and_feature_order()
         print("Model loaded successfully. Feature order:")
-        _debug_print("MODEL_FEATURE_ORDER", MODEL_FEATURE_ORDER)
-    except Exception as e:
+        _log_debug("MODEL_FEATURE_ORDER", MODEL_FEATURE_ORDER)
+    except Exception:
         MODEL = None
         MODEL_FEATURE_ORDER = None
-        print("ERROR: Failed to load model in startup_event.")
+        print("ERROR: Failed to load model at startup.")
         print(traceback.format_exc())
 
-    # read thresholds from env if present
-    try:
-        LTV_LOW_THRESHOLD = safe_float(os.environ.get("LTV_LOW_THRESHOLD", LTV_LOW_THRESHOLD))
-        LTV_MED_THRESHOLD = safe_float(os.environ.get("LTV_MED_THRESHOLD", LTV_MED_THRESHOLD))
-        print(f"Segmentation thresholds loaded: low={LTV_LOW_THRESHOLD}, med={LTV_MED_THRESHOLD}")
-    except Exception:
-        print("WARNING: Error reading threshold env vars:")
-        print(traceback.format_exc())
+    # Read segmentation thresholds from environment (if provided)
+    LTV_LOW_THRESHOLD = safe_float(os.environ.get("LTV_LOW_THRESHOLD", LTV_LOW_THRESHOLD))
+    LTV_MED_THRESHOLD = safe_float(os.environ.get("LTV_MED_THRESHOLD", LTV_MED_THRESHOLD))
+    print(f"Segmentation thresholds set: low={LTV_LOW_THRESHOLD}, med={LTV_MED_THRESHOLD}")
 
-    # Build SHAP TreeExplainer
+    # Build SHAP TreeExplainer if shap package is available and model is loaded
     EXPLAINER = None
-    try:
-        if MODEL is not None:
-            EXPLAINER = shap.TreeExplainer(MODEL)
-            print("SHAP TreeExplainer created successfully.")
-        else:
-            print("Model not loaded; skipping SHAP explainer creation.")
-    except Exception as e:
-        EXPLAINER = None
-        print("SHAP explainer creation FAILED during startup.")
-        print(traceback.format_exc())
+    if shap is None:
+        print("SHAP package not available in runtime (shap is None). Explanations disabled.")
+    else:
+        try:
+            if MODEL is not None:
+                EXPLAINER = shap.TreeExplainer(MODEL)
+                print("SHAP TreeExplainer built successfully.")
+            else:
+                print("Model not loaded; cannot build SHAP explainer.")
+        except Exception:
+            EXPLAINER = None
+            print("Failed to build SHAP TreeExplainer at startup.")
+            print(traceback.format_exc())
 
-# ----------------------------
-# Health endpoint
-# ----------------------------
+# ---------- Health endpoint ----------
 @app.get("/health")
 def health():
     return {
@@ -139,56 +139,57 @@ def health():
         "thresholds": {"low": LTV_LOW_THRESHOLD, "med": LTV_MED_THRESHOLD}
     }
 
-# ----------------------------
-# Predict endpoint (verbose)
-# ----------------------------
+# ---------- Prediction endpoint ----------
 @app.post("/predict", response_model=List[PredictResponseItem])
 def predict(req: PredictRequest):
     try:
         if MODEL is None or MODEL_FEATURE_ORDER is None:
             raise HTTPException(status_code=503, detail="Model not loaded on server.")
 
+        # Prepare data
         customers_list = [c.dict() for c in req.customers]
         X, ids = prepare_input_df(customers_list, MODEL_FEATURE_ORDER)
 
-        # Convert to DataFrame if not already
+        # ensure X is DataFrame with correct column order
         if not isinstance(X, pd.DataFrame):
             try:
                 X = pd.DataFrame(X, columns=MODEL_FEATURE_ORDER)
             except Exception:
                 X = pd.DataFrame(X)
 
-        _debug_print("Input DataFrame shape and head", {"shape": X.shape, "head": X.head(3).to_dict()})
+        _log_debug("Input shape", {"shape": X.shape, "columns": X.columns.tolist()})
 
+        # Predictions
         preds_raw = MODEL.predict(X)
         preds = [float(max(0.0, p)) for p in preds_raw]
 
+        # Read thresholds (allow per-request override via env if needed)
         low_th = safe_float(os.environ.get("LTV_LOW_THRESHOLD", LTV_LOW_THRESHOLD))
         med_th = safe_float(os.environ.get("LTV_MED_THRESHOLD", LTV_MED_THRESHOLD))
 
-        need_expl = bool(req.return_explanation)
-        _debug_print("Request flags", {"return_explanation": need_expl})
-
+        need_expl = bool(req.return_explanation) and (EXPLAINER is not None)
         shap_values = None
-        if need_expl:
+
+        if bool(req.return_explanation):
             if EXPLAINER is None:
-                print("Client requested explanation but EXPLAINER is None (not built).")
+                print("Client requested explanation but EXPLAINER is not available (None).")
             else:
                 try:
-                    # Compute SHAP explanations
                     expl_res = EXPLAINER(X)
+                    # Extract values robustly
                     if hasattr(expl_res, "values"):
                         shap_values = np.array(expl_res.values)
                     else:
+                        # fallback: some SHAP versions return array-like directly
                         shap_values = np.array(expl_res)
-                    _debug_print("shap_values shape", getattr(shap_values, "shape", None))
+                    _log_debug("shap_values shape", getattr(shap_values, "shape", None))
                     # Validate shape
                     if shap_values.ndim != 2 or shap_values.shape[1] != len(MODEL_FEATURE_ORDER):
-                        print("Unexpected shap_values shape. Disabling explanations for this request.")
-                        _debug_print("shap_values full", shap_values if shap_values is not None else "None")
+                        print("Unexpected SHAP values shape; disabling explanations for this request.")
+                        _log_debug("shap_values full", shap_values)
                         shap_values = None
                 except Exception:
-                    print("SHAP computation FAILED at runtime for this request:")
+                    print("SHAP computation failed for this request.")
                     print(traceback.format_exc())
                     shap_values = None
 
@@ -211,7 +212,7 @@ def predict(req: PredictRequest):
 
             results.append(item)
 
-        _debug_print("Response preview", results[:2])
+        _log_debug("Response preview", results[:2])
         return results
 
     except HTTPException:
