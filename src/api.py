@@ -1,24 +1,20 @@
 # src/api.py
 """
 Safe CLTV API that exposes `app` for Uvicorn.
-Uses XGBoost pred_contribs as explanation fallback if SHAP is unavailable.
+Uses XGBoost pred_contribs fallback (set FORCE_USE_CONTRIBS env var to 'true' to force).
 """
 
 import os, traceback
 from typing import List, Optional, Dict, Any
-
-import numpy as np
-import pandas as pd
+import numpy as np, pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-# optional SHAP
 try:
     import shap
 except Exception:
     shap = None
 
-# optional XGBoost
 try:
     import xgboost as xgb
 except Exception:
@@ -26,19 +22,15 @@ except Exception:
 
 from .model_utils import load_model_and_feature_order, prepare_input_df
 
-# === Expose app for Uvicorn ===
 app = FastAPI(title="CLTV Prediction API", version="1.0")
 
-# Globals
 MODEL = None
 MODEL_FEATURE_ORDER: Optional[List[str]] = None
 EXPLAINER = None
 USE_CONTRIBS_FORCED = os.environ.get("FORCE_USE_CONTRIBS", "false").lower() in ("1","true","yes")
-
 LTV_LOW_THRESHOLD = float(os.environ.get("LTV_LOW_THRESHOLD", 50.0))
 LTV_MED_THRESHOLD = float(os.environ.get("LTV_MED_THRESHOLD", 200.0))
 
-# Schemas
 class CustomerFeatures(BaseModel):
     customer_id: str
     frequency: float = 0.0
@@ -68,20 +60,16 @@ class PredictResponseItem(BaseModel):
     explanation: Optional[List[FeatureImpact]]
 
 def ltv_to_segment(v, low, med):
-    if v < low:
-        return "Low"
-    if v < med:
-        return "Medium"
+    if v < low: return "Low"
+    if v < med: return "Medium"
     return "High"
 
 def compute_xgb_contribs(model, Xdf):
     try:
         X_np = Xdf.values if isinstance(Xdf, pd.DataFrame) else np.array(Xdf)
         booster = None
-        if hasattr(model, "get_booster"):
-            booster = model.get_booster()
-        elif hasattr(model, "booster_"):
-            booster = model.booster_
+        if hasattr(model, "get_booster"): booster = model.get_booster()
+        elif hasattr(model, "booster_"): booster = model.booster_
         if booster is not None and xgb is not None:
             dmat = xgb.DMatrix(X_np, feature_names=list(Xdf.columns) if hasattr(Xdf, "columns") else None)
             contribs = booster.predict(dmat, pred_contribs=True)
@@ -114,7 +102,7 @@ def startup_event():
         print("Model load failed:", traceback.format_exc())
 
     if USE_CONTRIBS_FORCED:
-        print("FORCE_USE_CONTRIBS set -> skipping SHAP")
+        print("FORCE_USE_CONTRIBS is set -> skipping SHAP explainer")
         return
 
     if shap is not None and MODEL is not None:
@@ -126,7 +114,7 @@ def startup_event():
             print("SHAP explainer built")
         except Exception:
             EXPLAINER = None
-            print("SHAP explainer build failed:", traceback.format_exc())
+            print("SHAP explainer failed:", traceback.format_exc())
 
 @app.get("/health")
 def health():
@@ -143,15 +131,12 @@ def health():
 def predict(req: PredictRequest):
     if MODEL is None or MODEL_FEATURE_ORDER is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
-
     X, ids = prepare_input_df([c.dict() for c in req.customers], MODEL_FEATURE_ORDER)
-
     preds = MODEL.predict(X)
     preds = [float(max(0.0, p)) for p in preds]
 
     shap_values = None
     contribs = None
-
     if req.return_explanation:
         if not USE_CONTRIBS_FORCED and EXPLAINER is not None:
             try:
@@ -178,5 +163,4 @@ def predict(req: PredictRequest):
         if expl is not None:
             res["explanation"] = expl
         results.append(res)
-
     return results
