@@ -1,11 +1,9 @@
-cd "C:/Users/Sanket/Desktop/Documents/Tasks/cltv-project" && \
-cp src/api.py src/api.py.bak || true && \
-cat > src/api.py <<'PY'
+
 # src/api.py
 """
 CLTV Prediction API with forced contribs toggle.
 Set environment variable FORCE_USE_CONTRIBS=true to always use XGBoost pred_contribs fallback.
-This file contains no raw Windows backslash paths.
+Overwrite your existing src/api.py with this file when ready.
 """
 
 import os
@@ -311,5 +309,3 @@ def predict(req: PredictRequest):
         tb = traceback.format_exc()
         print("Unhandled exception in /predict:", tb)
         raise HTTPException(status_code=500, detail=tb)
-PY
-git add src/api.py && git commit -m "Auto replace api.py with forced-contribs version" && git push origin main
