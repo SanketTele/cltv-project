@@ -1,7 +1,8 @@
 # src/api.py
 """
-CLTV Prediction API with robust SHAP explainer builder.
-This file does NOT contain any Windows backslash paths to avoid unicodeescape issues.
+CLTV Prediction API with robust SHAP + XGBoost pred_contribs fallback.
+Overwrite this file at:
+C:/Users/Sanket/Desktop/Documents/Tasks/cltv-project/src/api.py
 """
 
 import os
@@ -14,16 +15,17 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-# shap may be installed in Docker environment; handle if missing locally
+# Try to import shap; may not be present in all environments
 try:
     import shap  # type: ignore
 except Exception:
     shap = None
 
-# local helpers
+# Local helpers
 from .model_utils import load_model_and_feature_order, prepare_input_df
+import xgboost as xgb
 
-app = FastAPI(title="CLTV Prediction API (SHAP robust)", version="1.0")
+app = FastAPI(title="CLTV Prediction API (SHAP + pred_contribs fallback)", version="1.0")
 
 # Globals
 MODEL = None
@@ -32,7 +34,7 @@ EXPLAINER = None
 LTV_LOW_THRESHOLD = 50.0
 LTV_MED_THRESHOLD = 200.0
 
-# Pydantic schemas
+# Schemas
 class CustomerFeatures(BaseModel):
     customer_id: str = Field(..., example="C101")
     frequency: float = 0.0
@@ -84,16 +86,10 @@ def _debug_print(title: str, obj: Any = None):
             print("Could not print debug object of type:", type(obj))
     print("==== /DEBUG ====")
 
-# Robust SHAP explainer builder
+# Robust SHAP explainer builder (unchanged from previous)
 def build_shap_explainer(model, sample_X=None):
-    """
-    Try multiple ways to construct a SHAP explainer:
-    1) If model has get_booster() or booster_ -> use Booster with TreeExplainer.
-    2) Try TreeExplainer(model).
-    3) Fallback to shap.Explainer(model, data=sample_X).
-    """
     if shap is None:
-        print("SHAP is not installed in runtime.")
+        print("SHAP not installed.")
         return None
 
     booster = None
@@ -113,43 +109,41 @@ def build_shap_explainer(model, sample_X=None):
     except Exception:
         booster = None
 
+    # Try Booster -> TreeExplainer
     if booster is not None:
         try:
             expl = shap.TreeExplainer(booster)
-            print("SHAP TreeExplainer built from Booster successfully.")
+            print("SHAP TreeExplainer built from Booster.")
             return expl
-        except Exception as e:
-            print("Failed to build TreeExplainer from Booster:", e)
-            print("Traceback:", traceback.format_exc())
+        except Exception:
+            print("Failed TreeExplainer from Booster:", traceback.format_exc())
 
+    # Try TreeExplainer with model
     try:
         expl = shap.TreeExplainer(model)
-        print("SHAP TreeExplainer built from model successfully.")
+        print("SHAP TreeExplainer built from model.")
         return expl
-    except Exception as e:
-        print("Failed to build TreeExplainer from model:", e)
-        print("Traceback:", traceback.format_exc())
+    except Exception:
+        print("Failed TreeExplainer from model:", traceback.format_exc())
 
+    # Fallback to generic Explainer with sample data
     try:
         if sample_X is not None:
             expl = shap.Explainer(model, sample_X)
-            print("SHAP generic Explainer built with sample data (fallback).")
+            print("SHAP generic Explainer built with sample data.")
             return expl
         else:
             expl = shap.Explainer(model)
-            print("SHAP generic Explainer built without sample data (fallback).")
+            print("SHAP generic Explainer built without sample data.")
             return expl
-    except Exception as e:
-        print("Failed to build generic SHAP Explainer:", e)
-        print("Traceback:", traceback.format_exc())
+    except Exception:
+        print("Failed generic SHAP Explainer:", traceback.format_exc())
 
     return None
 
-# Startup event: load model, thresholds, build explainer
 @app.on_event("startup")
 def startup_event():
     global MODEL, MODEL_FEATURE_ORDER, EXPLAINER, LTV_LOW_THRESHOLD, LTV_MED_THRESHOLD
-
     try:
         MODEL, MODEL_FEATURE_ORDER = load_model_and_feature_order()
         print("Model loaded. Feature order:")
@@ -157,7 +151,7 @@ def startup_event():
     except Exception:
         MODEL = None
         MODEL_FEATURE_ORDER = None
-        print("ERROR: Failed to load model at startup.")
+        print("Failed to load model at startup:")
         print(traceback.format_exc())
 
     LTV_LOW_THRESHOLD = safe_float(os.environ.get("LTV_LOW_THRESHOLD", LTV_LOW_THRESHOLD))
@@ -166,20 +160,60 @@ def startup_event():
 
     EXPLAINER = None
     if MODEL is None:
-        print("Model not loaded; SKIPPING SHAP explainer creation.")
+        print("Model not loaded; skipping explainer build.")
         return
 
     sample_X = None
     try:
-        sample_X = pd.DataFrame([ {f: 0.0 for f in MODEL_FEATURE_ORDER} ])
+        sample_X = pd.DataFrame([{f: 0.0 for f in MODEL_FEATURE_ORDER}])
     except Exception:
         sample_X = None
 
-    print("Attempting to build SHAP explainer (robust).")
+    print("Attempt to build SHAP explainer (robust).")
     EXPLAINER = build_shap_explainer(MODEL, sample_X=sample_X)
     print("EXPLAINER built:", EXPLAINER is not None)
 
-# Health
+# Helper: try to compute XGBoost per-sample contributions (pred_contribs)
+def compute_xgb_contribs(model, X_df):
+    """
+    Returns numpy array of contributions shape (n_samples, n_features)
+    or None on failure.
+    Works with sklearn XGBRegressor wrappers and with Booster objects.
+    """
+    try:
+        X_np = X_df.values if isinstance(X_df, pd.DataFrame) else np.array(X_df)
+        # if sklearn wrapper, get booster
+        booster = None
+        try:
+            if hasattr(model, "get_booster"):
+                booster = model.get_booster()
+            elif hasattr(model, "booster_"):
+                booster = model.booster_
+        except Exception:
+            booster = None
+
+        if booster is not None:
+            dmat = xgb.DMatrix(X_np, feature_names=list(X_df.columns) if hasattr(X_df, "columns") else None)
+            contribs = booster.predict(dmat, pred_contribs=True)
+            contribs = np.array(contribs)
+            # if xgboost returns extra bias column (n_features+1), drop last column
+            if contribs.ndim == 2 and contribs.shape[1] == len(X_df.columns) + 1:
+                contribs = contribs[:, :len(X_df.columns)]
+            return contribs
+        else:
+            # If model itself is XGBRegressor and supports predict with pred_contribs
+            try:
+                contribs = model.predict(X_np, pred_contribs=True)  # sklearn wrapper sometimes supports this
+                contribs = np.array(contribs)
+                if contribs.ndim == 2 and contribs.shape[1] == len(X_df.columns) + 1:
+                    contribs = contribs[:, :len(X_df.columns)]
+                return contribs
+            except Exception:
+                return None
+    except Exception:
+        print("compute_xgb_contribs failed:", traceback.format_exc())
+        return None
+
 @app.get("/health")
 def health():
     return {
@@ -190,7 +224,6 @@ def health():
         "thresholds": {"low": LTV_LOW_THRESHOLD, "med": LTV_MED_THRESHOLD}
     }
 
-# Predict endpoint
 @app.post("/predict", response_model=List[PredictResponseItem])
 def predict(req: PredictRequest):
     try:
@@ -206,7 +239,7 @@ def predict(req: PredictRequest):
             except Exception:
                 X = pd.DataFrame(X)
 
-        _debug_print("Input shape and head", {"shape": X.shape, "head": X.head(2).to_dict()})
+        _debug_print("Input shape", {"shape": X.shape, "columns": X.columns.tolist()})
 
         preds_raw = MODEL.predict(X)
         preds = [float(max(0.0, p)) for p in preds_raw]
@@ -216,41 +249,53 @@ def predict(req: PredictRequest):
 
         need_expl = bool(req.return_explanation)
         shap_values = None
+        contribs = None
 
         if need_expl:
-            if EXPLAINER is None:
-                print("Explanation requested but EXPLAINER is None.")
-            else:
+            # First try SHAP explainer if available
+            if EXPLAINER is not None:
                 try:
                     expl_res = EXPLAINER(X)
-                    if hasattr(expl_res, "values"):
-                        shap_values = np.array(expl_res.values)
-                    else:
-                        shap_values = np.array(expl_res)
+                    shap_values = np.array(expl_res.values) if hasattr(expl_res, "values") else np.array(expl_res)
                     _debug_print("shap_values shape", getattr(shap_values, "shape", None))
                     if shap_values.ndim != 2 or shap_values.shape[1] != len(MODEL_FEATURE_ORDER):
-                        print("Unexpected shap_values shape; disabling explanations for this request.")
-                        _debug_print("shap_values sample", shap_values[:2] if shap_values is not None else None)
+                        print("Unexpected shap_values shape; will try XGBoost contribs fallback.")
                         shap_values = None
                 except Exception:
-                    print("SHAP computation failed at runtime:")
+                    print("SHAP runtime failed; will try XGBoost contribs fallback.")
                     print(traceback.format_exc())
                     shap_values = None
 
+            # If SHAP unavailable or failed, try XGBoost pred_contribs fallback
+            if shap_values is None:
+                contribs = compute_xgb_contribs(MODEL, X)
+                if contribs is not None:
+                    _debug_print("contribs shape", getattr(contribs, "shape", None))
+                    # Ensure shape matches features
+                    if contribs.ndim != 2 or contribs.shape[1] != len(MODEL_FEATURE_ORDER):
+                        print("Unexpected contribs shape; ignoring explanations.")
+                        contribs = None
+
+        # Build response
         results: List[Dict[str, Any]] = []
         for i, cid in enumerate(ids):
             pred = preds[i]
             seg = ltv_to_segment(pred, low_th, med_th)
             item: Dict[str, Any] = {"customer_id": cid, "predicted_LTV": pred, "segment": seg}
 
+            explanation_list = None
             if shap_values is not None:
                 row = shap_values[i]
                 abs_vals = np.abs(row)
-                k = 3
-                top_idx = abs_vals.argsort()[::-1][:k]
-                explanation_list = []
-                for idx in top_idx:
-                    explanation_list.append({"feature": MODEL_FEATURE_ORDER[idx], "impact": float(row[idx])})
+                top_idx = abs_vals.argsort()[::-1][:3]
+                explanation_list = [{"feature": MODEL_FEATURE_ORDER[idx], "impact": float(row[idx])} for idx in top_idx]
+            elif contribs is not None:
+                row = contribs[i]
+                abs_vals = np.abs(row)
+                top_idx = abs_vals.argsort()[::-1][:3]
+                explanation_list = [{"feature": MODEL_FEATURE_ORDER[idx], "impact": float(row[idx])} for idx in top_idx]
+
+            if explanation_list is not None:
                 item["explanation"] = explanation_list
 
             results.append(item)
